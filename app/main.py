@@ -1166,6 +1166,10 @@ def explain_endpoint(
     page_size: int = Query(20, ge=1, le=100),
 ):
     if endpoint == "attendance_list":
+        if date_from:
+            validate_date(date_from, "date_from")
+        if date_to:
+            validate_date(date_to, "date_to")
         if date_from and date_to and date_from > date_to:
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="date_from cannot be after date_to")
 
