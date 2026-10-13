@@ -25,26 +25,36 @@ load_dotenv()
 MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
 MONGO_DB = os.getenv("MONGO_DB", "attendance_db")
 
-# Server selection timeout set to 2000ms so failures fail fast instead of blocking for 30s
-client: MongoClient = MongoClient(MONGO_URI, tz_aware=True, serverSelectionTimeoutMS=2000)
+import time as _time
+
+# Timeout set to 8000ms for resilient remote connections (e.g. MongoDB Atlas)
+client: MongoClient = MongoClient(MONGO_URI, tz_aware=True, serverSelectionTimeoutMS=8000)
 db = client[MONGO_DB]
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
 
 def init_db():
-    """Ensure required indexes are created idempotently at startup."""
-    # employees
-    db.employees.create_index([("emp_code", 1)], unique=True)
-    db.employees.create_index([("department", 1), ("emp_code", 1)])
-    db.employees.create_index([("department", 1), ("joined_on", 1)])
-    db.employees.create_index([("joined_on", 1)])
+    """Ensure required indexes are created idempotently at startup with retries."""
+    deadline = _time.time() + 15.0
+    while True:
+        try:
+            # employees
+            db.employees.create_index([("emp_code", 1)], unique=True)
+            db.employees.create_index([("department", 1), ("emp_code", 1)])
+            db.employees.create_index([("department", 1), ("joined_on", 1)])
+            db.employees.create_index([("joined_on", 1)])
 
-    # attendance_logs
-    db.attendance_logs.create_index([("emp_code", 1), ("date", 1)], unique=True)
-    db.attendance_logs.create_index([("date", -1), ("emp_code", 1)])
-    db.attendance_logs.create_index([("emp_code", 1), ("punch_in", -1)])
-    db.attendance_logs.create_index([("date", 1), ("late_minutes", 1)])
+            # attendance_logs
+            db.attendance_logs.create_index([("emp_code", 1), ("date", 1)], unique=True)
+            db.attendance_logs.create_index([("date", -1), ("emp_code", 1)])
+            db.attendance_logs.create_index([("emp_code", 1), ("punch_in", -1)])
+            db.attendance_logs.create_index([("date", 1), ("late_minutes", 1)])
+            break
+        except Exception as e:
+            if _time.time() >= deadline:
+                raise
+            _time.sleep(1.0)
 
 
 @asynccontextmanager
@@ -328,7 +338,7 @@ def create_employee(body: EmployeeCreate):
 @app.get("/employees", tags=["employees"])
 def list_employees(
     department: Optional[str] = Query(None),
-    page: int = Query(1, ge=1),
+    page: int = Query(1, ge=1, le=1000000000),
     page_size: int = Query(20, ge=1, le=100),
 ):
     q: Dict[str, Any] = {}
@@ -430,7 +440,7 @@ def list_attendance(
     date_from: Optional[str] = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
     date_to: Optional[str] = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
     status_filter: Optional[StatusType] = Query(None, alias="status"),
-    page: int = Query(1, ge=1),
+    page: int = Query(1, ge=1, le=1000000000),
     page_size: int = Query(20, ge=1, le=100),
 ):
     if date_from:
@@ -1162,7 +1172,7 @@ def explain_endpoint(
     status_filter: Optional[StatusType] = Query(None, alias="status"),
     from_date: Optional[str] = Query(None, alias="from"),
     to_date: Optional[str] = Query(None, alias="to"),
-    page: int = Query(1, ge=1),
+    page: int = Query(1, ge=1, le=1000000000),
     page_size: int = Query(20, ge=1, le=100),
 ):
     if endpoint == "attendance_list":
