@@ -14,8 +14,8 @@ from typing import Annotated, Any, Dict, List, Literal, Optional
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query, Path, status
-from fastapi.responses import HTMLResponse
-from pydantic import BaseModel, Field
+from fastapi.responses import RedirectResponse
+from pydantic import BaseModel, Field, model_validator
 from pymongo import MongoClient, ReturnDocument
 from pymongo.errors import DuplicateKeyError
 
@@ -25,7 +25,8 @@ load_dotenv()
 MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
 MONGO_DB = os.getenv("MONGO_DB", "attendance_db")
 
-client: MongoClient = MongoClient(MONGO_URI, tz_aware=True)
+# Server selection timeout set to 2000ms so failures fail fast instead of blocking for 30s
+client: MongoClient = MongoClient(MONGO_URI, tz_aware=True, serverSelectionTimeoutMS=2000)
 db = client[MONGO_DB]
 
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -33,20 +34,17 @@ IST = timezone(timedelta(hours=5, minutes=30))
 
 def init_db():
     """Ensure required indexes are created idempotently at startup."""
-    try:
-        # employees
-        db.employees.create_index([("emp_code", 1)], unique=True)
-        db.employees.create_index([("department", 1), ("emp_code", 1)])
-        db.employees.create_index([("department", 1), ("joined_on", 1)])
-        db.employees.create_index([("joined_on", 1)])
+    # employees
+    db.employees.create_index([("emp_code", 1)], unique=True)
+    db.employees.create_index([("department", 1), ("emp_code", 1)])
+    db.employees.create_index([("department", 1), ("joined_on", 1)])
+    db.employees.create_index([("joined_on", 1)])
 
-        # attendance_logs
-        db.attendance_logs.create_index([("emp_code", 1), ("date", 1)], unique=True)
-        db.attendance_logs.create_index([("date", -1), ("emp_code", 1)])
-        db.attendance_logs.create_index([("emp_code", 1), ("date", -1)])
-        db.attendance_logs.create_index([("date", 1), ("late_minutes", 1)])
-    except Exception as e:
-        print(f"Index creation warning: {e}")
+    # attendance_logs
+    db.attendance_logs.create_index([("emp_code", 1), ("date", 1)], unique=True)
+    db.attendance_logs.create_index([("date", -1), ("emp_code", 1)])
+    db.attendance_logs.create_index([("emp_code", 1), ("punch_in", -1)])
+    db.attendance_logs.create_index([("date", 1), ("late_minutes", 1)])
 
 
 @asynccontextmanager
@@ -65,13 +63,16 @@ app = FastAPI(
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
+_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+
 def dt_to_epoch_ms(dt: Optional[datetime]) -> Optional[int]:
-    """Convert a datetime to epoch milliseconds."""
+    """Convert a datetime to epoch milliseconds (exact integer arithmetic, no float rounding)."""
     if dt is None:
         return None
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
-    return int(dt.timestamp() * 1000)
+    return (dt - _EPOCH) // timedelta(milliseconds=1)
 
 
 def epoch_ms_to_dt(ms: int) -> datetime:
@@ -89,6 +90,21 @@ def round_half_up(val: float, decimals: int = 2) -> float:
     """Round a float using ROUND_HALF_UP (R4, R8)."""
     fmt = "0." + "0" * decimals
     return float(Decimal(str(val)).quantize(Decimal(fmt), rounding=ROUND_HALF_UP))
+
+
+def validate_date(date_str: str, field_name: str = "date") -> dt_date:
+    """
+    Parse a yyyy-mm-dd string into a real calendar date.
+    Raises HTTP 422 for impossible dates (e.g. 2026-02-30) instead of
+    letting fromisoformat() bubble up as an unhandled 500.
+    """
+    try:
+        return dt_date.fromisoformat(date_str)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"'{field_name}' is not a valid calendar date: {date_str!r}",
+        )
 
 
 def get_attendance_date(punch_in_dt: datetime, shift_start: str, shift_end: str) -> str:
@@ -238,6 +254,16 @@ class EmployeeCreate(BaseModel):
     shift_end: str = Field("18:30", pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
     joined_on: str = Field(..., pattern=r"^\d{4}-\d{2}-\d{2}$")
 
+    @model_validator(mode="after")
+    def validate_employee(self) -> "EmployeeCreate":
+        try:
+            dt_date.fromisoformat(self.joined_on)
+        except ValueError:
+            raise ValueError(f"joined_on is not a valid calendar date: {self.joined_on!r}")
+        if self.shift_start == self.shift_end:
+            raise ValueError("shift_start must differ from shift_end")
+        return self
+
 
 class PunchInRequest(BaseModel):
     emp_code: str
@@ -261,494 +287,11 @@ class RegularizeRequest(BaseModel):
 # --------------------------------------------------------------------------- #
 # Endpoints
 # --------------------------------------------------------------------------- #
-DASHBOARD_HTML = """<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Employee Attendance & Analytics Portal</title>
-  <script src="https://cdn.tailwindcss.com"></script>
-  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-  <style>
-    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
-    body { font-family: 'Inter', sans-serif; }
-  </style>
-</head>
-<body class="bg-slate-900 text-slate-100 min-h-screen flex flex-col">
 
-  <!-- Header -->
-  <header class="border-b border-slate-800 bg-slate-950/80 backdrop-blur sticky top-0 z-50">
-    <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4 flex flex-wrap items-center justify-between gap-4">
-      <div class="flex items-center space-x-3">
-        <div class="w-10 h-10 rounded-xl bg-indigo-600 flex items-center justify-center text-white shadow-lg shadow-indigo-500/30">
-          <i class="fa-solid fa-clock text-lg"></i>
-        </div>
-        <div>
-          <h1 class="text-lg font-bold text-white tracking-tight">Stitch Attendance & Analytics</h1>
-          <p class="text-xs text-slate-400">FastAPI + MongoDB Backend & Live Dashboard</p>
-        </div>
-      </div>
-      <div class="flex items-center gap-3">
-        <div id="healthBadge" class="flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-semibold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
-          <span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
-          Checking System...
-        </div>
-        <a href="/docs" target="_blank" class="px-4 py-2 text-xs font-semibold rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white shadow-md transition flex items-center gap-2">
-          <i class="fa-solid fa-code"></i> Swagger API Docs
-        </a>
-        <a href="/redoc" target="_blank" class="px-4 py-2 text-xs font-semibold rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition flex items-center gap-2">
-          <i class="fa-solid fa-book"></i> ReDoc
-        </a>
-      </div>
-    </div>
-  </header>
-
-  <!-- Main Content -->
-  <main class="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-8 space-y-8">
-    
-    <!-- Quick Stats Cards -->
-    <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-5">
-      <div class="bg-slate-800/60 border border-slate-700/60 rounded-2xl p-5 shadow-sm">
-        <div class="flex items-center justify-between text-slate-400 text-xs font-medium mb-3">
-          <span>TOTAL EMPLOYEES</span>
-          <i class="fa-solid fa-users text-indigo-400 text-sm"></i>
-        </div>
-        <div id="statTotalEmployees" class="text-3xl font-extrabold text-white">--</div>
-        <p class="text-xs text-slate-400 mt-2">Active across departments</p>
-      </div>
-
-      <div class="bg-slate-800/60 border border-slate-700/60 rounded-2xl p-5 shadow-sm">
-        <div class="flex items-center justify-between text-slate-400 text-xs font-medium mb-3">
-          <span>RECORDED LOGS</span>
-          <i class="fa-solid fa-calendar-check text-emerald-400 text-sm"></i>
-        </div>
-        <div id="statTotalLogs" class="text-3xl font-extrabold text-white">--</div>
-        <p class="text-xs text-slate-400 mt-2">Seeded attendance days</p>
-      </div>
-
-      <div class="bg-slate-800/60 border border-slate-700/60 rounded-2xl p-5 shadow-sm">
-        <div class="flex items-center justify-between text-slate-400 text-xs font-medium mb-3">
-          <span>SELECTED MONTH</span>
-          <i class="fa-solid fa-calendar-days text-amber-400 text-sm"></i>
-        </div>
-        <div class="flex items-center gap-2">
-          <input type="month" id="monthSelector" value="2026-07" onchange="refreshAll()" class="bg-slate-900 border border-slate-700 rounded-lg text-sm px-2 py-1 text-white focus:outline-none focus:border-indigo-500 font-semibold">
-        </div>
-        <p class="text-xs text-slate-400 mt-2">Filter all monthly analytics</p>
-      </div>
-
-      <div class="bg-slate-800/60 border border-slate-700/60 rounded-2xl p-5 shadow-sm">
-        <div class="flex items-center justify-between text-slate-400 text-xs font-medium mb-3">
-          <span>QUICK ACTIONS</span>
-          <i class="fa-solid fa-bolt text-purple-400 text-sm"></i>
-        </div>
-        <div class="flex gap-2">
-          <button onclick="openPunchModal('in')" class="flex-1 bg-emerald-600/20 hover:bg-emerald-600/30 text-emerald-300 border border-emerald-500/30 rounded-xl py-2 text-xs font-semibold transition">
-            Punch In
-          </button>
-          <button onclick="openPunchModal('out')" class="flex-1 bg-indigo-600/20 hover:bg-indigo-600/30 text-indigo-300 border border-indigo-500/30 rounded-xl py-2 text-xs font-semibold transition">
-            Punch Out
-          </button>
-        </div>
-        <p class="text-xs text-slate-400 mt-2">Simulate real punch events</p>
-      </div>
-    </div>
-
-    <!-- Analytics Section -->
-    <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
-      
-      <!-- Department Summary -->
-      <div class="lg:col-span-2 bg-slate-800/60 border border-slate-700/60 rounded-2xl p-6 shadow-sm flex flex-col">
-        <div class="flex items-center justify-between mb-4">
-          <div>
-            <h2 class="text-base font-bold text-white flex items-center gap-2">
-              <i class="fa-solid fa-chart-pie text-indigo-400"></i> Department Monthly Summary
-            </h2>
-            <p class="text-xs text-slate-400">Headcount, present days, and average working hours</p>
-          </div>
-          <button onclick="loadDeptSummary()" class="text-xs text-slate-400 hover:text-white transition">
-            <i class="fa-solid fa-arrows-rotate"></i>
-          </button>
-        </div>
-        <div class="overflow-x-auto flex-1">
-          <table class="w-full text-left text-xs border-collapse">
-            <thead>
-              <tr class="border-b border-slate-700 text-slate-400 uppercase tracking-wider font-semibold">
-                <th class="py-3 px-3">Department</th>
-                <th class="py-3 px-3 text-center">Headcount</th>
-                <th class="py-3 px-3 text-center">Present Days</th>
-                <th class="py-3 px-3 text-center">Avg Work Hrs</th>
-                <th class="py-3 px-3 text-center">Late Count</th>
-                <th class="py-3 px-3 text-center">Late Mins</th>
-                <th class="py-3 px-3 text-center">Leaves</th>
-              </tr>
-            </thead>
-            <tbody id="deptSummaryTable" class="divide-y divide-slate-800 text-slate-200">
-              <tr><td colspan="7" class="py-4 text-center text-slate-500">Loading department data...</td></tr>
-            </tbody>
-          </table>
-        </div>
-      </div>
-
-      <!-- Late Leaderboard -->
-      <div class="bg-slate-800/60 border border-slate-700/60 rounded-2xl p-6 shadow-sm flex flex-col">
-        <div class="flex items-center justify-between mb-4">
-          <div>
-            <h2 class="text-base font-bold text-white flex items-center gap-2">
-              <i class="fa-solid fa-trophy text-amber-400"></i> Late Leaderboard
-            </h2>
-            <p class="text-xs text-slate-400">Standard competition ranking (1, 2, 2, 4)</p>
-          </div>
-          <button onclick="loadLeaderboard()" class="text-xs text-slate-400 hover:text-white transition">
-            <i class="fa-solid fa-arrows-rotate"></i>
-          </button>
-        </div>
-        <div class="flex-1 overflow-y-auto max-h-72">
-          <div id="leaderboardList" class="space-y-2">
-            <p class="text-xs text-slate-500 text-center py-4">Loading leaderboard...</p>
-          </div>
-        </div>
-      </div>
-
-    </div>
-
-    <!-- Employees Directory & Attendance Logs Tabs -->
-    <div class="bg-slate-800/60 border border-slate-700/60 rounded-2xl p-6 shadow-sm">
-      <div class="flex flex-wrap items-center justify-between gap-4 border-b border-slate-700 pb-4 mb-6">
-        <div class="flex items-center gap-4">
-          <button id="tabEmployeesBtn" onclick="switchTab('employees')" class="text-sm font-bold text-indigo-400 border-b-2 border-indigo-400 pb-1">
-            <i class="fa-solid fa-id-badge mr-1"></i> Employees Directory
-          </button>
-          <button id="tabAttendanceBtn" onclick="switchTab('attendance')" class="text-sm font-bold text-slate-400 hover:text-slate-200 pb-1">
-            <i class="fa-solid fa-clipboard-user mr-1"></i> Attendance Records
-          </button>
-        </div>
-        <div class="text-xs text-slate-400 flex items-center gap-2">
-          <span>Backend status:</span>
-          <span class="text-emerald-400 font-semibold">MongoDB 8.3 &bull; FastAPI 2.0</span>
-        </div>
-      </div>
-
-      <!-- Employees Tab -->
-      <div id="tabEmployees">
-        <div class="overflow-x-auto">
-          <table class="w-full text-left text-xs border-collapse">
-            <thead>
-              <tr class="border-b border-slate-700 text-slate-400 uppercase tracking-wider font-semibold">
-                <th class="py-3 px-3">Emp Code</th>
-                <th class="py-3 px-3">Name</th>
-                <th class="py-3 px-3">Email</th>
-                <th class="py-3 px-3">Department</th>
-                <th class="py-3 px-3">Shift (IST)</th>
-                <th class="py-3 px-3">Joined On</th>
-              </tr>
-            </thead>
-            <tbody id="employeesTable" class="divide-y divide-slate-800 text-slate-200">
-              <tr><td colspan="6" class="py-4 text-center text-slate-500">Loading employees...</td></tr>
-            </tbody>
-          </table>
-        </div>
-      </div>
-
-      <!-- Attendance Tab -->
-      <div id="tabAttendance" class="hidden">
-        <div class="overflow-x-auto">
-          <table class="w-full text-left text-xs border-collapse">
-            <thead>
-              <tr class="border-b border-slate-700 text-slate-400 uppercase tracking-wider font-semibold">
-                <th class="py-3 px-3">Date</th>
-                <th class="py-3 px-3">Emp Code</th>
-                <th class="py-3 px-3">Status</th>
-                <th class="py-3 px-3">Work Hours</th>
-                <th class="py-3 px-3">Late Mins</th>
-                <th class="py-3 px-3">Overtime</th>
-                <th class="py-3 px-3">Half Day</th>
-                <th class="py-3 px-3">History</th>
-              </tr>
-            </thead>
-            <tbody id="attendanceTable" class="divide-y divide-slate-800 text-slate-200">
-              <tr><td colspan="8" class="py-4 text-center text-slate-500">Loading attendance logs...</td></tr>
-            </tbody>
-          </table>
-        </div>
-      </div>
-    </div>
-
-  </main>
-
-  <!-- Footer -->
-  <footer class="border-t border-slate-800 bg-slate-950 py-4 text-center text-xs text-slate-500">
-    Employee Attendance & Analytics API &bull; Running on <a href="http://localhost:8000" class="text-indigo-400 hover:underline">http://localhost:8000</a> &bull; Interactive API Docs at <a href="/docs" class="text-indigo-400 hover:underline">/docs</a>
-  </footer>
-
-  <!-- Punch Modal -->
-  <div id="punchModal" class="fixed inset-0 bg-slate-950/80 backdrop-blur-sm z-50 hidden flex items-center justify-center p-4">
-    <div class="bg-slate-900 border border-slate-700 rounded-2xl max-w-md w-full p-6 shadow-2xl space-y-4">
-      <div class="flex items-center justify-between">
-        <h3 id="punchModalTitle" class="text-base font-bold text-white">Punch In</h3>
-        <button onclick="closePunchModal()" class="text-slate-400 hover:text-white"><i class="fa-solid fa-xmark"></i></button>
-      </div>
-      <div class="space-y-3 text-xs">
-        <div>
-          <label class="block text-slate-400 mb-1">Employee Code</label>
-          <select id="modalEmpCode" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-white focus:outline-none focus:border-indigo-500"></select>
-        </div>
-        <div id="statusSelectGroup">
-          <label class="block text-slate-400 mb-1">Status</label>
-          <select id="modalStatus" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-white focus:outline-none focus:border-indigo-500">
-            <option value="PRESENT">PRESENT</option>
-            <option value="WFH">WFH</option>
-            <option value="ON_DUTY">ON_DUTY</option>
-          </select>
-        </div>
-        <div id="modalAlert" class="hidden p-3 rounded-lg text-xs font-semibold"></div>
-      </div>
-      <div class="flex justify-end gap-2 pt-2">
-        <button onclick="closePunchModal()" class="px-4 py-2 rounded-lg bg-slate-800 text-slate-300 hover:bg-slate-700 text-xs font-semibold">Cancel</button>
-        <button id="modalSubmitBtn" onclick="submitPunch()" class="px-4 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold">Confirm</button>
-      </div>
-    </div>
-  </div>
-
-  <script>
-    let punchMode = 'in';
-
-    async function checkHealth() {
-      try {
-        const res = await fetch('/health');
-        const data = await res.json();
-        const badge = document.getElementById('healthBadge');
-        if (data.status === 'ok') {
-          badge.className = 'flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-semibold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20';
-          badge.innerHTML = '<span class="w-2 h-2 rounded-full bg-emerald-400"></span> Backend Online';
-        } else {
-          badge.className = 'flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-semibold bg-rose-500/10 text-rose-400 border border-rose-500/20';
-          badge.innerHTML = '<span class="w-2 h-2 rounded-full bg-rose-400"></span> Service Degraded';
-        }
-      } catch (err) {
-        const badge = document.getElementById('healthBadge');
-        badge.className = 'flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-semibold bg-rose-500/10 text-rose-400 border border-rose-500/20';
-        badge.innerHTML = '<span class="w-2 h-2 rounded-full bg-rose-400"></span> Server Offline';
-      }
-    }
-
-    async function loadEmployees() {
-      try {
-        const res = await fetch('/employees?page=1&page_size=100');
-        const data = await res.json();
-        document.getElementById('statTotalEmployees').innerText = data.total;
-        
-        const tbody = document.getElementById('employeesTable');
-        const select = document.getElementById('modalEmpCode');
-        select.innerHTML = '';
-
-        if (!data.items || data.items.length === 0) {
-          tbody.innerHTML = '<tr><td colspan="6" class="py-4 text-center text-slate-500">No employees found</td></tr>';
-          return;
-        }
-
-        tbody.innerHTML = data.items.map(e => `
-          <tr class="hover:bg-slate-800/40 transition">
-            <td class="py-3 px-3 font-semibold text-indigo-400">${e.emp_code}</td>
-            <td class="py-3 px-3 font-medium text-white">${e.name}</td>
-            <td class="py-3 px-3 text-slate-400">${e.email}</td>
-            <td class="py-3 px-3"><span class="px-2 py-0.5 rounded-md bg-slate-700 text-slate-300 font-medium">${e.department}</span></td>
-            <td class="py-3 px-3 text-slate-300">${e.shift_start} - ${e.shift_end}</td>
-            <td class="py-3 px-3 text-slate-400">${e.joined_on}</td>
-          </tr>
-        `).join('');
-
-        select.innerHTML = data.items.map(e => `<option value="${e.emp_code}">${e.emp_code} - ${e.name} (${e.department})</option>`).join('');
-      } catch (err) {
-        console.error(err);
-      }
-    }
-
-    async function loadAttendance() {
-      try {
-        const res = await fetch('/attendance?page=1&page_size=100');
-        const data = await res.json();
-        document.getElementById('statTotalLogs').innerText = data.total;
-
-        const tbody = document.getElementById('attendanceTable');
-        if (!data.items || data.items.length === 0) {
-          tbody.innerHTML = '<tr><td colspan="8" class="py-4 text-center text-slate-500">No records found</td></tr>';
-          return;
-        }
-
-        tbody.innerHTML = data.items.map(a => `
-          <tr class="hover:bg-slate-800/40 transition">
-            <td class="py-3 px-3 font-semibold text-slate-200">${a.date}</td>
-            <td class="py-3 px-3 font-semibold text-indigo-400">${a.emp_code}</td>
-            <td class="py-3 px-3">
-              <span class="px-2 py-0.5 rounded-md text-[11px] font-semibold ${
-                a.status === 'PRESENT' ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20' :
-                a.status === 'WFH' ? 'bg-blue-500/10 text-blue-400 border border-blue-500/20' :
-                a.status === 'ON_DUTY' ? 'bg-purple-500/10 text-purple-400 border border-purple-500/20' :
-                'bg-rose-500/10 text-rose-400 border border-rose-500/20'
-              }">
-                ${a.status}
-              </span>
-            </td>
-            <td class="py-3 px-3 font-medium text-white">${a.work_hours !== null ? a.work_hours + ' hrs' : '<span class="text-slate-500">In Progress</span>'}</td>
-            <td class="py-3 px-3 ${a.late_minutes > 0 ? 'text-amber-400 font-bold' : 'text-slate-400'}">${a.late_minutes} m</td>
-            <td class="py-3 px-3 ${a.overtime_minutes > 0 ? 'text-emerald-400 font-bold' : 'text-slate-400'}">${a.overtime_minutes} m</td>
-            <td class="py-3 px-3">${a.half_day ? '<span class="text-amber-400 font-semibold">Yes (0.5)</span>' : '<span class="text-slate-500">No</span>'}</td>
-            <td class="py-3 px-3 text-slate-400">${a.history && a.history.length > 0 ? a.history.length + ' edit(s)' : 'None'}</td>
-          </tr>
-        `).join('');
-      } catch (err) {
-        console.error(err);
-      }
-    }
-
-    async function loadDeptSummary() {
-      const month = document.getElementById('monthSelector').value;
-      try {
-        const res = await fetch(`/analytics/departments/summary?month=${month}`);
-        const data = await res.json();
-        const tbody = document.getElementById('deptSummaryTable');
-
-        if (!data.items || data.items.length === 0) {
-          tbody.innerHTML = '<tr><td colspan="7" class="py-4 text-center text-slate-500">No department data for this month</td></tr>';
-          return;
-        }
-
-        tbody.innerHTML = data.items.map(d => `
-          <tr class="hover:bg-slate-800/40 transition">
-            <td class="py-3 px-3 font-semibold text-white">${d.department}</td>
-            <td class="py-3 px-3 text-center font-semibold text-slate-300">${d.headcount}</td>
-            <td class="py-3 px-3 text-center text-emerald-400 font-semibold">${d.present_days}</td>
-            <td class="py-3 px-3 text-center font-semibold text-indigo-300">${d.avg_work_hours !== null ? d.avg_work_hours : 'N/A'}</td>
-            <td class="py-3 px-3 text-center ${d.late_count > 0 ? 'text-amber-400 font-bold' : 'text-slate-400'}">${d.late_count}</td>
-            <td class="py-3 px-3 text-center ${d.total_late_minutes > 0 ? 'text-amber-400 font-bold' : 'text-slate-400'}">${d.total_late_minutes}</td>
-            <td class="py-3 px-3 text-center text-slate-400">${d.leave_count}</td>
-          </tr>
-        `).join('');
-      } catch (err) {
-        console.error(err);
-      }
-    }
-
-    async function loadLeaderboard() {
-      const month = document.getElementById('monthSelector').value;
-      try {
-        const res = await fetch(`/analytics/leaderboard/late?month=${month}&limit=10`);
-        const data = await res.json();
-        const container = document.getElementById('leaderboardList');
-
-        if (!data.items || data.items.length === 0) {
-          container.innerHTML = '<p class="text-xs text-slate-500 text-center py-6">No late employees recorded this month 🎉</p>';
-          return;
-        }
-
-        container.innerHTML = data.items.map(item => `
-          <div class="flex items-center justify-between p-2.5 rounded-xl bg-slate-900/60 border border-slate-700/50 hover:border-slate-600 transition">
-            <div class="flex items-center gap-3">
-              <span class="w-6 h-6 rounded-full flex items-center justify-center text-xs font-bold ${
-                item.rank === 1 ? 'bg-amber-500 text-slate-950 shadow-sm shadow-amber-500/30' :
-                item.rank === 2 ? 'bg-slate-300 text-slate-950' :
-                item.rank === 3 ? 'bg-amber-700 text-white' :
-                'bg-slate-800 text-slate-400'
-              }">${item.rank}</span>
-              <div>
-                <p class="text-xs font-bold text-white">${item.name} <span class="text-[11px] font-normal text-slate-400">(${item.emp_code})</span></p>
-                <p class="text-[10px] text-slate-400">${item.department} &bull; ${item.late_count} late days</p>
-              </div>
-            </div>
-            <div class="text-right">
-              <span class="text-xs font-extrabold text-amber-400">${item.total_late_minutes} m</span>
-              <p class="text-[10px] text-slate-500">total late</p>
-            </div>
-          </div>
-        `).join('');
-      } catch (err) {
-        console.error(err);
-      }
-    }
-
-    function switchTab(tab) {
-      const btnEmp = document.getElementById('tabEmployeesBtn');
-      const btnAtt = document.getElementById('tabAttendanceBtn');
-      const viewEmp = document.getElementById('tabEmployees');
-      const viewAtt = document.getElementById('tabAttendance');
-
-      if (tab === 'employees') {
-        btnEmp.className = 'text-sm font-bold text-indigo-400 border-b-2 border-indigo-400 pb-1';
-        btnAtt.className = 'text-sm font-bold text-slate-400 hover:text-slate-200 pb-1';
-        viewEmp.classList.remove('hidden');
-        viewAtt.classList.add('hidden');
-      } else {
-        btnAtt.className = 'text-sm font-bold text-indigo-400 border-b-2 border-indigo-400 pb-1';
-        btnEmp.className = 'text-sm font-bold text-slate-400 hover:text-slate-200 pb-1';
-        viewAtt.classList.remove('hidden');
-        viewEmp.classList.add('hidden');
-      }
-    }
-
-    function openPunchModal(mode) {
-      punchMode = mode;
-      document.getElementById('punchModalTitle').innerText = mode === 'in' ? 'Punch In Employee' : 'Punch Out Employee';
-      document.getElementById('modalSubmitBtn').innerText = mode === 'in' ? 'Confirm Punch In' : 'Confirm Punch Out';
-      document.getElementById('statusSelectGroup').style.display = mode === 'in' ? 'block' : 'none';
-      document.getElementById('modalAlert').className = 'hidden';
-      document.getElementById('punchModal').classList.remove('hidden');
-    }
-
-    function closePunchModal() {
-      document.getElementById('punchModal').classList.add('hidden');
-    }
-
-    async function submitPunch() {
-      const emp_code = document.getElementById('modalEmpCode').value;
-      const status = document.getElementById('modalStatus').value;
-      const alertBox = document.getElementById('modalAlert');
-
-      try {
-        let url = punchMode === 'in' ? '/attendance/punch-in' : '/attendance/punch-out';
-        let body = punchMode === 'in' ? { emp_code, status } : { emp_code };
-
-        const res = await fetch(url, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(body)
-        });
-        const data = await res.json();
-
-        if (res.ok) {
-          alertBox.className = 'p-3 rounded-lg text-xs font-semibold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20';
-          alertBox.innerText = `Success! ${punchMode === 'in' ? 'Punched in for date ' + data.date : 'Punched out! Work hours: ' + data.work_hours}`;
-          refreshAll();
-          setTimeout(closePunchModal, 1500);
-        } else {
-          alertBox.className = 'p-3 rounded-lg text-xs font-semibold bg-rose-500/10 text-rose-400 border border-rose-500/20';
-          alertBox.innerText = data.detail || 'Failed to process request';
-        }
-      } catch (err) {
-        alertBox.className = 'p-3 rounded-lg text-xs font-semibold bg-rose-500/10 text-rose-400 border border-rose-500/20';
-        alertBox.innerText = err.message;
-      }
-    }
-
-    function refreshAll() {
-      checkHealth();
-      loadEmployees();
-      loadAttendance();
-      loadDeptSummary();
-      loadLeaderboard();
-    }
-
-    // Initialize
-    refreshAll();
-  </script>
-</body>
-</html>
-"""
-
-
-@app.get('/', include_in_schema=False, response_class=HTMLResponse)
-def root_dashboard():
-    return HTMLResponse(content=DASHBOARD_HTML)
+@app.get("/", include_in_schema=False)
+def root_redirect():
+    """Redirect root to the interactive API docs."""
+    return RedirectResponse(url="/docs")
 
 
 @app.get("/health", tags=["system"])
@@ -762,9 +305,6 @@ def health():
 
 @app.post("/employees", status_code=status.HTTP_201_CREATED, tags=["employees"])
 def create_employee(body: EmployeeCreate):
-    if body.shift_start == body.shift_end:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="shift_start must differ from shift_end")
-
     now = now_utc_dt()
     doc = {
         "emp_code": body.emp_code,
@@ -893,6 +433,10 @@ def list_attendance(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
 ):
+    if date_from:
+        validate_date(date_from, "date_from")
+    if date_to:
+        validate_date(date_to, "date_to")
     if date_from and date_to and date_from > date_to:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="date_from cannot be after date_to")
 
@@ -1035,10 +579,23 @@ def regularize_attendance(
         "changes": changes,
     }
 
-    # Concurrent safety: ensure history array hasn't changed underneath us
+    # Concurrent safety: ensure history array hasn't changed underneath us.
+    # IMPORTANT: {history: []} only matches an explicit empty array; it does NOT match
+    # a document where the field is absent (legacy records that were inserted without a
+    # history field).  When current_history is empty we must also allow the missing-field
+    # case via $exists: false.
     current_history = record.get("history") or []
+    if current_history:
+        history_filter: Dict[str, Any] = {"history": current_history}
+    else:
+        history_filter = {
+            "$or": [
+                {"history": []},
+                {"history": {"$exists": False}},
+            ]
+        }
     updated = db.attendance_logs.find_one_and_update(
-        {"_id": record["_id"], "history": current_history},
+        {"_id": record["_id"], **history_filter},
         {
             "$set": {
                 "status": new_status,
@@ -1060,33 +617,9 @@ def regularize_attendance(
     return format_attendance_record(updated)
 
 
-@app.get("/analytics/employees/{emp_code}/monthly", tags=["analytics"])
-def employee_monthly(
-    emp_code: str = Path(...),
-    month: str = Query(..., pattern=r"^\d{4}-(0[1-9]|1[0-2])$"),
-):
-    emp = db.employees.find_one({"emp_code": emp_code})
-    if not emp:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Employee not found")
-
-    year, mon = map(int, month.split("-"))
-    num_days = calendar.monthrange(year, mon)[1]
-    month_start = f"{month}-01"
-    month_end = f"{month}-{num_days:02d}"
-
-    # Calculate working_days (Mon-Fri) from max(month_start, joined_on) to month_end (R7)
-    joined_on = emp["joined_on"]
-    start_calc_d = max(month_start, joined_on)
-    working_days = 0
-    if start_calc_d <= month_end:
-        cur_d = dt_date.fromisoformat(start_calc_d)
-        end_d = dt_date.fromisoformat(month_end)
-        while cur_d <= end_d:
-            if cur_d.weekday() < 5:  # Mon-Fri
-                working_days += 1
-            cur_d += timedelta(days=1)
-
-    pipeline = [
+def build_employee_monthly_pipeline(emp_code: str, month_start: str, month_end: str) -> list:
+    """Return the aggregation pipeline used by employee_monthly and its explain branch."""
+    return [
         {
             "$match": {
                 "emp_code": emp_code,
@@ -1128,6 +661,35 @@ def employee_monthly(
             }
         },
     ]
+
+
+@app.get("/analytics/employees/{emp_code}/monthly", tags=["analytics"])
+def employee_monthly(
+    emp_code: str = Path(...),
+    month: str = Query(..., pattern=r"^\d{4}-(0[1-9]|1[0-2])$"),
+):
+    emp = db.employees.find_one({"emp_code": emp_code})
+    if not emp:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Employee not found")
+
+    year, mon = map(int, month.split("-"))
+    num_days = calendar.monthrange(year, mon)[1]
+    month_start = f"{month}-01"
+    month_end = f"{month}-{num_days:02d}"
+
+    # Calculate working_days (Mon-Fri) from max(month_start, joined_on) to month_end (R7)
+    joined_on = emp["joined_on"]
+    start_calc_d = max(month_start, joined_on)
+    working_days = 0
+    if start_calc_d <= month_end:
+        cur_d = dt_date.fromisoformat(start_calc_d)
+        end_d = dt_date.fromisoformat(month_end)
+        while cur_d <= end_d:
+            if cur_d.weekday() < 5:  # Mon-Fri
+                working_days += 1
+            cur_d += timedelta(days=1)
+
+    pipeline = build_employee_monthly_pipeline(emp_code, month_start, month_end)
 
     agg_res = list(db.attendance_logs.aggregate(pipeline))
     if agg_res:
@@ -1183,123 +745,122 @@ def build_department_summary_pipeline(month_start: str, month_end: str, departme
                                 ]
                             }
                         }
-                    }
+                    },
+                    {
+                        "$group": {
+                            "_id": None,
+                            "present_days": {
+                                "$sum": {
+                                    "$cond": [
+                                        {
+                                            "$and": [
+                                                {"$in": ["$status", ["PRESENT", "WFH", "ON_DUTY"]]},
+                                                {
+                                                    "$in": [
+                                                        {
+                                                            "$dayOfWeek": {
+                                                                "$dateFromString": {
+                                                                    "dateString": "$date"
+                                                                }
+                                                            }
+                                                        },
+                                                        [2, 3, 4, 5, 6],
+                                                    ]
+                                                },
+                                            ]
+                                        },
+                                        {"$cond": [{"$eq": ["$half_day", True]}, 0.5, 1.0]},
+                                        0,
+                                    ]
+                                }
+                            },
+                            "sum_work_hours": {
+                                "$sum": {
+                                    "$cond": [
+                                        {
+                                            "$and": [
+                                                {"$in": ["$status", ["PRESENT", "WFH", "ON_DUTY"]]},
+                                                {"$ne": ["$work_hours", None]},
+                                            ]
+                                        },
+                                        "$work_hours",
+                                        0,
+                                    ]
+                                }
+                            },
+                            "count_work_hours": {
+                                "$sum": {
+                                    "$cond": [
+                                        {
+                                            "$and": [
+                                                {"$in": ["$status", ["PRESENT", "WFH", "ON_DUTY"]]},
+                                                {"$ne": ["$work_hours", None]},
+                                            ]
+                                        },
+                                        1,
+                                        0,
+                                    ]
+                                }
+                            },
+                            "late_count": {
+                                "$sum": {
+                                    "$cond": [{"$gt": [{"$ifNull": ["$late_minutes", 0]}, 0]}, 1, 0]
+                                }
+                            },
+                            "total_late_minutes": {
+                                "$sum": {"$ifNull": ["$late_minutes", 0]}
+                            },
+                            "leave_count": {
+                                "$sum": {
+                                    "$cond": [{"$eq": ["$status", "LEAVE"]}, 1, 0]
+                                }
+                            },
+                            "on_duty_count": {
+                                "$sum": {
+                                    "$cond": [{"$eq": ["$status", "ON_DUTY"]}, 1, 0]
+                                }
+                            },
+                        }
+                    },
                 ],
-                "as": "logs",
+                "as": "emp_summary",
+            }
+        },
+        {
+            "$addFields": {
+                "summary": {"$arrayElemAt": ["$emp_summary", 0]}
             }
         },
         {
             "$group": {
                 "_id": "$department",
                 "headcount": {"$sum": 1},
-                "all_logs": {"$push": "$logs"},
+                "present_days": {"$sum": {"$ifNull": ["$summary.present_days", 0.0]}},
+                "total_work_hours": {"$sum": {"$ifNull": ["$summary.sum_work_hours", 0.0]}},
+                "work_hours_count": {"$sum": {"$ifNull": ["$summary.count_work_hours", 0]}},
+                "late_count": {"$sum": {"$ifNull": ["$summary.late_count", 0]}},
+                "total_late_minutes": {"$sum": {"$ifNull": ["$summary.total_late_minutes", 0]}},
+                "leave_count": {"$sum": {"$ifNull": ["$summary.leave_count", 0]}},
+                "on_duty_count": {"$sum": {"$ifNull": ["$summary.on_duty_count", 0]}},
             }
         },
         {
             "$project": {
-                "department": "$_id",
                 "_id": 0,
+                "department": "$_id",
                 "headcount": 1,
-                "flat_logs": {
-                    "$reduce": {
-                        "input": "$all_logs",
-                        "initialValue": [],
-                        "in": {"$concatArrays": ["$$value", "$$this"]},
-                    }
-                },
-            }
-        },
-        {
-            "$project": {
-                "department": 1,
-                "headcount": 1,
-                "present_days": {
-                    "$sum": {
-                        "$map": {
-                            "input": {
-                                "$filter": {
-                                    "input": "$flat_logs",
-                                    "as": "l",
-                                    "cond": {
-                                        "$and": [
-                                            {"$in": ["$$l.status", ["PRESENT", "WFH", "ON_DUTY"]]},
-                                            {
-                                                "$in": [
-                                                    {
-                                                        "$dayOfWeek": {
-                                                            "$dateFromString": {
-                                                                "dateString": "$$l.date"
-                                                            }
-                                                        }
-                                                    },
-                                                    [2, 3, 4, 5, 6],
-                                                ]
-                                            },
-                                        ]
-                                    },
-                                }
-                            },
-                            "as": "p",
-                            "in": {"$cond": [{"$eq": ["$$p.half_day", True]}, 0.5, 1.0]},
-                        }
-                    }
-                },
+                "present_days": 1,
                 "avg_work_hours": {
-                    "$avg": {
-                        "$map": {
-                            "input": {
-                                "$filter": {
-                                    "input": "$flat_logs",
-                                    "as": "l",
-                                    "cond": {
-                                        "$and": [
-                                            {"$in": ["$$l.status", ["PRESENT", "WFH", "ON_DUTY"]]},
-                                            {"$ne": ["$$l.work_hours", None]},
-                                        ]
-                                    },
-                                }
-                            },
-                            "as": "w",
-                            "in": "$$w.work_hours",
-                        }
-                    }
+                    "$cond": [
+                        {"$gt": ["$work_hours_count", 0]},
+                        {"$divide": ["$total_work_hours", "$work_hours_count"]},
+                        None,
+                    ]
                 },
-                "late_count": {
-                    "$size": {
-                        "$filter": {
-                            "input": "$flat_logs",
-                            "as": "l",
-                            "cond": {"$gt": [{"$ifNull": ["$$l.late_minutes", 0]}, 0]},
-                        }
-                    }
-                },
-                "total_late_minutes": {
-                    "$sum": {
-                        "$map": {
-                            "input": "$flat_logs",
-                            "as": "l",
-                            "in": {"$ifNull": ["$$l.late_minutes", 0]},
-                        }
-                    }
-                },
-                "leave_count": {
-                    "$size": {
-                        "$filter": {
-                            "input": "$flat_logs",
-                            "as": "l",
-                            "cond": {"$eq": ["$$l.status", "LEAVE"]},
-                        }
-                    }
-                },
-                "on_duty_count": {
-                    "$size": {
-                        "$filter": {
-                            "input": "$flat_logs",
-                            "as": "l",
-                            "cond": {"$eq": ["$$l.status", "ON_DUTY"]},
-                        }
-                    }
-                },
+                "late_count": 1,
+                "total_late_minutes": 1,
+                "leave_count": 1,
+                "on_duty_count": 1,
             }
         },
         {"$sort": {"department": 1}},
@@ -1508,12 +1069,11 @@ def build_department_trend_pipeline(department: str, from_date: str, to_date: st
                                 {"$gt": ["$headcount", 0]},
                             ]
                         },
-                        {
-                            "$round": [
-                                {"$divide": ["$present_count", "$headcount"]},
-                                4,
-                            ]
-                        },
+                        # Keep full precision — Python's round_half_up handles R8.
+                        # Do NOT use $round here: MongoDB uses round-half-to-even
+                        # (banker's rounding), which would corrupt half-way values
+                        # such as 1/32 = 0.03125 (rounds to 0.0312 instead of 0.0313).
+                        {"$divide": ["$present_count", "$headcount"]},
                         None,
                     ]
                 }
@@ -1537,14 +1097,9 @@ def build_department_trend_pipeline(department: str, from_date: str, to_date: st
                 "headcount": 1,
                 "present_count": 1,
                 "late_count": 1,
+                # Pass full precision; Python rounds with round_half_up.
                 "attendance_rate": 1,
-                "moving_avg_7d": {
-                    "$cond": [
-                        {"$ne": ["$moving_avg_7d", None]},
-                        {"$round": ["$moving_avg_7d", 4]},
-                        None,
-                    ]
-                },
+                "moving_avg_7d": 1,
             }
         },
     ]
@@ -1561,8 +1116,8 @@ def department_trend(
     if not dept_emps:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Unknown department")
 
-    d_from = dt_date.fromisoformat(from_date)
-    d_to = dt_date.fromisoformat(to_date)
+    d_from = validate_date(from_date, "from")
+    d_to = validate_date(to_date, "to")
 
     if d_to < d_from:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="'to' must be on or after 'from'")
@@ -1648,10 +1203,8 @@ def explain_endpoint(
         month_start = f"{month}-01"
         month_end = f"{month}-{num_days:02d}"
 
-        pipeline = [
-            {"$match": {"emp_code": emp_code, "date": {"$gte": month_start, "$lte": month_end}}},
-            {"$group": {"_id": None, "total_late_minutes": {"$sum": "$late_minutes"}}},
-        ]
+        # Use the same pipeline as the endpoint, not a stripped-down version.
+        pipeline = build_employee_monthly_pipeline(emp_code, month_start, month_end)
         cmd = {
             "aggregate": "attendance_logs",
             "pipeline": pipeline,
@@ -1702,8 +1255,8 @@ def explain_endpoint(
         if not from_date or not to_date:
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="'from' and 'to' dates are required")
 
-        d_from = dt_date.fromisoformat(from_date)
-        d_to = dt_date.fromisoformat(to_date)
+        d_from = validate_date(from_date, "from")
+        d_to = validate_date(to_date, "to")
         if d_to < d_from or (d_to - d_from).days > 92:
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid date range")
 
